@@ -1,6 +1,4 @@
 
-
-```markdown
 # Kubernetes DevOps Sandbox
 
 ## Overview
