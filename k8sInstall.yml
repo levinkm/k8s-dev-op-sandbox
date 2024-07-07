@@ -1,0 +1,235 @@
+---
+- name: Install Kubernetes, Docker, and Traefik
+  hosts: all
+  become: yes
+  vars:
+    kubernetes_version: "1.30"
+    kubeadm_config_file: /etc/kubernetes/kubeadm-config.yaml
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+          - software-properties-common
+        state: present
+
+    # Docker and containerd installation
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+
+    - name: Install Docker and containerd
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+
+    - name: Ensure Docker is started and enabled
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    # Kubernetes installation
+    - name: Create /etc/apt/keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Kubernetes GPG key
+      get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key"
+        dest: /tmp/kubernetes.key
+
+    - name: Import Kubernetes GPG key
+      command: gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/kubernetes.key
+
+    - name: Add Kubernetes repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /"
+        state: present
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Kubernetes components
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Pin Kubernetes component versions
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Enable kubelet service
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: started
+
+    # Traefik installation
+    - name: Create Traefik directory
+      file:
+        path: /opt/traefik
+        state: directory
+
+    - name: Download Traefik binary
+      get_url:
+        url: https://github.com/traefik/traefik/releases/download/v2.5.3/traefik_v2.5.3_linux_amd64.tar.gz
+        dest: /opt/traefik/traefik.tar.gz
+
+    - name: Extract Traefik
+      unarchive:
+        src: /opt/traefik/traefik.tar.gz
+        dest: /opt/traefik
+        remote_src: yes
+
+    - name: Create Traefik service
+      copy:
+        content: |
+          [Unit]
+          Description=Traefik
+          
+          [Service]
+          ExecStart=/opt/traefik/traefik
+          Restart=always
+          
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/traefik.service
+
+    - name: Start and enable Traefik service
+      systemd:
+        name: traefik
+        state: started
+        enabled: yes
+
+    # Containerd setup
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+
+    - name: Configure containerd
+      shell: containerd config default > /etc/containerd/config.toml
+
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: yes
+
+    # Kubernetes cluster initialization
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Remove swap from /etc/fstab
+      mount:
+        name: "{{ item }}"
+        fstype: swap
+        state: absent
+      with_items:
+        - swap
+        - none
+
+    - name: Enable and load kernel modules
+      shell: |
+        modprobe overlay
+        modprobe br_netfilter
+
+    - name: Add kernel settings
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+      loop:
+        - { key: "net.bridge.bridge-nf-call-iptables", value: "1" }
+        - { key: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
+        - { key: "net.ipv4.ip_forward", value: "1" }
+
+    - name: Create kubeadm config file
+      copy:
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          apiServer:
+            certSANs:
+            - "192.168.56.10"
+          networking:
+            podSubnet: "10.244.0.0/16"
+        dest: "{{ kubeadm_config_file }}"
+
+    - name: Initialize Kubernetes cluster
+      command: kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address=192.168.56.10
+      register: kubeadm_init
+
+    - name: Create .kube directory
+      file:
+        path: /home/vagrant/.kube
+        state: directory
+        owner: vagrant
+        group: vagrant
+
+    - name: Copy admin.conf to user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/vagrant/.kube/config
+        remote_src: yes
+        owner: vagrant
+        group: vagrant
+
+    - name: Install Flannel network
+      become: false
+      command: kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+
+    - name: Remove taints from control-plane node
+      become: false
+      command: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+
+    - name: Get join command
+      command: kubeadm token create --print-join-command
+      register: join_command
+    
+    # Adding namespaces(Production and Development)
+    - name: Copy kube config to shared folder
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /vagrant/kubeconfig
+        remote_src: yes
+    - name: Create development namespace
+      become: false
+      command: kubectl create namespace development
+      register: create_dev_namespace
+      failed_when: create_dev_namespace.rc != 0 and "AlreadyExists" not in create_dev_namespace.stderr
+
+    - name: Create production namespace
+      become: false
+      command: kubectl create namespace production
+      register: create_prod_namespace
+      failed_when: create_prod_namespace.rc != 0 and "AlreadyExists" not in create_prod_namespace.stderr
